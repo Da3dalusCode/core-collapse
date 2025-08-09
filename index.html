@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Core Collapse</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+    canvas { display: block; background: radial-gradient(circle at center, #101018 0%, #000 70%); }
+    .noselect { user-select: none; -webkit-user-select: none; -ms-user-select: none; }
+  </style>
+</head>
+<body class="noselect">
+<canvas id="game"></canvas>
+<script>
+// =============================
+// Core Collapse — Canvas Game
+// =============================
+// This revision:
+// - Adds an INTERWAVE pause between waves (banner + 2s break)
+// - Slows escalation: waves advance ONLY by collected energy (threshold = 30)
+// - Ensures enemies spawn immediately each wave + timed spawns
+// - Fixes Game Over screen flow (separate state branch, replay button)
+
+// ---------- Canvas Setup ----------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+// ---------- State ----------
+let gameState = 'menu'; // 'menu' | 'playing' | 'interwave' | 'gameover'
+let energy = 60;                 // start below cap so pickups matter immediately
+let wave = 1;
+let lastTime = performance.now();
+let elapsed = 0; // ms
+let enemySpawnTimer = 0; // ms accumulator
+let gameOverAt = null; // timestamp when death occurs
+let waveStartAt = performance.now();
+let showWaveBannerFor = 1200; // ms
+
+// Wave progression strictly by energy gained this wave
+const ENERGY_PER_ORB = 15;
+const ENERGY_GAIN_THRESHOLD = 30; // collect ~2 orbs to advance (slower than before)
+let energyGainedThisWave = 0;     // resets each wave
+
+// Interwave pause
+let interwaveEndAt = 0;
+let nextWave = 0;
+
+// Mouse & aiming
+let mouseX = canvas.width / 2;
+let mouseY = canvas.height / 2;
+let prevMouseX = mouseX;
+let prevMouseY = mouseY;
+let aimAngle = 0; // persists when mouse stops
+const NOSE_OFFSET = 28; // distance from ship center to nose
+let spaceHeld = false;
+
+// Entities
+const stars = []; // parallax background
+const playerBullets = [];
+const enemies = [];
+const enemyBullets = [];
+const explosions = [];
+const exhaustParticles = [];
+const energyOrbs = [];
+
+// Buttons (for menu and game over)
+let startBtn = null;
+let replayBtn = null;
+
+// ---------- Helpers ----------
+function rand(min, max){ return Math.random() * (max - min) + min; }
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function dist(a,b,x,y){ const dx=a-x, dy=b-y; return Math.hypot(dx,dy); }
+
+// ---------- Background Stars ----------
+function initStars() {
+  stars.length = 0;
+  const count = Math.floor((canvas.width * canvas.height) / 8000); // scale with screen
+  for (let i = 0; i < count; i++) {
+    stars.push({ x: Math.random()*canvas.width, y: Math.random()*canvas.height, size: Math.random()*1.6+0.2, speed: Math.random()*0.6+0.15 });
+  }
+}
+initStars();
+
+function drawStars(dt){
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  for (const s of stars){
+    s.x -= s.speed * (dt/16.67); // normalize to ~60fps
+    if (s.x < 0) s.x = canvas.width;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.size, 0, Math.PI*2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+  }
+}
+
+// ---------- Ship ----------
+const ship = {
+  x: canvas.width/2,
+  y: canvas.height/2,
+  angle: 0,
+  fireCooldown: 0,
+  update(dt){
+    // Nose should be at mouse; keep center behind nose by NOSE_OFFSET along angle
+    const dx = mouseX - prevMouseX;
+    const dy = mouseY - prevMouseY;
+    if (Math.hypot(dx,dy) > 0.5) {
+      aimAngle = Math.atan2(dy, dx); // update only when mouse moves meaningfully
+    }
+    this.angle = aimAngle;
+    const noseX = mouseX;
+    const noseY = mouseY;
+    this.x = noseX - Math.cos(this.angle) * NOSE_OFFSET;
+    this.y = noseY - Math.sin(this.angle) * NOSE_OFFSET;
+
+    // Shooting
+    if (spaceHeld && this.fireCooldown <= 0){
+      const speed = 8;
+      playerBullets.push({ x: noseX, y: noseY, vx: Math.cos(this.angle)*speed, vy: Math.sin(this.angle)*speed, r: 4 });
+      this.fireCooldown = 90; // ms
+    } else {
+      this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    }
+
+    // Exhaust particles from tail
+    const tailX = this.x - Math.cos(this.angle)*8;
+    const tailY = this.y - Math.sin(this.angle)*8;
+    exhaustParticles.push({ x: tailX, y: tailY, vx: -Math.cos(this.angle)*0.2 + rand(-0.3,0.3), vy: -Math.sin(this.angle)*0.2 + rand(-0.3,0.3), r: rand(1,2.5), life: 400 });
+  },
+  draw(){
+    // body
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    // hull
+    ctx.beginPath();
+    ctx.moveTo(NOSE_OFFSET, 0);            // nose
+    ctx.lineTo(-18, -12);
+    ctx.lineTo(-8, 0);
+    ctx.lineTo(-18, 12);
+    ctx.closePath();
+    ctx.fillStyle = '#00f0ff';
+    ctx.shadowBlur = 24; ctx.shadowColor = '#00eaff';
+    ctx.fill();
+    // cockpit glow
+    ctx.beginPath(); ctx.arc(-2,0,3,0,Math.PI*2);
+    ctx.fillStyle = '#7ef9ff'; ctx.shadowBlur = 18; ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // crosshair at mouse
+    ctx.save();
+    ctx.translate(mouseX, mouseY);
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2); ctx.strokeStyle = '#66ffff'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-10,0); ctx.lineTo(-4,0); ctx.moveTo(4,0); ctx.lineTo(10,0); ctx.moveTo(0,-10); ctx.lineTo(0,-4); ctx.moveTo(0,4); ctx.lineTo(0,10); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.restore();
+  }
+};
+
+// ---------- Energy Orbs ----------
+function spawnEnergyOrb(x,y){
+  energyOrbs.push({ x, y, vx: rand(-0.6,0.6), vy: rand(-0.6,0.6), r: 6, t: 0 });
+}
+
+function updateEnergyOrbs(dt){
+  for (let i=energyOrbs.length-1; i>=0; i--){
+    const o = energyOrbs[i];
+    o.t += dt;
+    o.x += o.vx * (dt/16.67); o.y += o.vy * (dt/16.67);
+    // gentle float
+    o.vx *= 0.995; o.vy *= 0.995;
+    // collect
+    if (dist(o.x,o.y, ship.x, ship.y) < 20){
+      energy = Math.min(100, energy + ENERGY_PER_ORB);
+      energyGainedThisWave += ENERGY_PER_ORB; // progress waves ONLY by collected energy
+      energyOrbs.splice(i,1);
+      continue;
+    }
+    // bounds
+    o.x = clamp(o.x, 5, canvas.width-5);
+    o.y = clamp(o.y, 5, canvas.height-5);
+  }
+}
+
+function drawEnergyOrbs(){
+  for (const o of energyOrbs){
+    const pulse = 0.5 + 0.5*Math.sin(o.t*0.01);
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r + pulse, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(0,255,120,0.85)';
+    ctx.shadowBlur = 20; ctx.shadowColor = '#00ff99';
+    ctx.fill(); ctx.shadowBlur = 0;
+  }
+}
+
+// ---------- Explosions ----------
+function spawnExplosion(x,y){
+  const count = 14 + (Math.random()*8|0);
+  for (let i=0;i<count;i++){
+    const ang = Math.random()*Math.PI*2; const sp = rand(1.6,3.1);
+    explosions.push({ x, y, vx: Math.cos(ang)*sp, vy: Math.sin(ang)*sp, r: rand(3,5), life: 600, hue: (Math.random()*360)|0 });
+  }
+}
+
+function updateExplosions(dt){
+  for (let i=explosions.length-1; i>=0; i--){
+    const p = explosions[i];
+    p.life -= dt; if (p.life<=0){ explosions.splice(i,1); continue; }
+    p.x += p.vx * (dt/16.67); p.y += p.vy * (dt/16.67);
+    p.r *= 0.985;
+  }
+}
+
+function drawExplosions(){
+  for (const p of explosions){
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fillStyle = `hsla(${p.hue},100%,70%,0.7)`; ctx.shadowBlur = 18; ctx.shadowColor = ctx.fillStyle; ctx.fill(); ctx.shadowBlur = 0;
+  }
+}
+
+// ---------- Enemies ----------
+function spawnEnemy(){
+  // spawn at screen edge to avoid insta-collisions
+  const side = Math.random();
+  let x,y; if (side<0.25){ x=0; y=rand(0,canvas.height);} else if (side<0.5){ x=canvas.width; y=rand(0,canvas.height);} else if (side<0.75){ x=rand(0,canvas.width); y=0;} else { x=rand(0,canvas.width); y=canvas.height; }
+  const baseSpeed = 0.35 + 0.10*wave; // toned down slightly
+  enemies.push({ x, y, r: 18, speed: baseSpeed, fireCd: rand(450,1000) });
+}
+
+function spawnInitialEnemiesForWave(){
+  const initial = clamp(1 + Math.floor(wave/1.5), 1, 4); // slower ramp
+  for (let i=0;i<initial;i++) spawnEnemy();
+}
+
+function updateEnemies(dt){
+  for (let i=enemies.length-1; i>=0; i--){
+    const e = enemies[i];
+    const dx = ship.x - e.x, dy = ship.y - e.y; const d = Math.hypot(dx,dy) || 1;
+    e.x += (dx/d) * e.speed * (dt/16.67);
+    e.y += (dy/d) * e.speed * (dt/16.67);
+
+    // fire at intervals
+    e.fireCd -= dt; if (e.fireCd<=0){
+      const ang = Math.atan2(ship.y - e.y, ship.x - e.x);
+      const sp = 3.8 + 0.2*wave; // slightly slower
+      enemyBullets.push({ x:e.x, y:e.y, vx:Math.cos(ang)*sp, vy:Math.sin(ang)*sp, r:4 });
+      e.fireCd = rand(800,1300) / Math.max(1, (0.85 + 0.12*wave));
+    }
+
+    // collision with ship
+    if (dist(e.x,e.y,ship.x,ship.y) < e.r + 16){
+      energy -= 20; spawnExplosion(e.x,e.y); spawnEnergyOrb(e.x,e.y); enemies.splice(i,1); continue;
+    }
+  }
+}
+
+function drawEnemies(){
+  for (const e of enemies){
+    ctx.beginPath(); ctx.arc(e.x,e.y,e.r,0,Math.PI*2);
+    ctx.fillStyle = '#ff8c00'; ctx.shadowBlur = 16; ctx.shadowColor = '#ff8c00'; ctx.fill(); ctx.shadowBlur = 0;
+    // eye
+    ctx.beginPath(); ctx.arc(e.x, e.y, 4, 0, Math.PI*2); ctx.fillStyle = '#fff'; ctx.fill();
+  }
+}
+
+// ---------- Bullets ----------
+function updatePlayerBullets(dt){
+  for (let i=playerBullets.length-1;i>=0;i--){
+    const b = playerBullets[i];
+    b.x += b.vx * (dt/16.67); b.y += b.vy * (dt/16.67);
+    // hit enemy
+    for (let j=enemies.length-1;j>=0;j--){
+      const e = enemies[j]; if (dist(b.x,b.y,e.x,e.y) < b.r + e.r){
+        spawnExplosion(e.x,e.y); spawnEnergyOrb(e.x,e.y);
+        enemies.splice(j,1); playerBullets.splice(i,1); break;
+      }
+    }
+    // offscreen
+    if (b.x< -10||b.x>canvas.width+10||b.y<-10||b.y>canvas.height+10){ playerBullets.splice(i,1); }
+  }
+}
+
+function drawPlayerBullets(){
+  ctx.fillStyle = '#7ef9ff';
+  for (const b of playerBullets){ ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.shadowBlur=12; ctx.shadowColor='#7ef9ff'; ctx.fill(); ctx.shadowBlur=0; }
+}
+
+function updateEnemyBullets(dt){
+  for (let i=enemyBullets.length-1;i>=0;i--){
+    const b = enemyBullets[i]; b.x += b.vx * (dt/16.67); b.y += b.vy * (dt/16.67);
+    if (dist(b.x,b.y,ship.x,ship.y) < b.r + 14){ energy -= 10; enemyBullets.splice(i,1); continue; }
+    if (b.x< -10||b.x>canvas.width+10||b.y<-10||b.y>canvas.height+10){ enemyBullets.splice(i,1); }
+  }
+}
+
+function drawEnemyBullets(){
+  ctx.fillStyle = '#ff3b3b';
+  for (const b of enemyBullets){ ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.shadowBlur=12; ctx.shadowColor='#ff3b3b'; ctx.fill(); ctx.shadowBlur=0; }
+}
+
+// ---------- Waves & Spawning ----------
+function resetWaveTimers(){
+  enemySpawnTimer = 0; waveStartAt = performance.now();
+  energyGainedThisWave = 0;                 // reset wave progression counter
+  spawnInitialEnemiesForWave();              // ensure enemies present immediately
+}
+
+function enterInterwave(){
+  // Clear bullets and enemies to create a clean pause
+  enemies.length = 0; enemyBullets.length = 0; playerBullets.length = 0; energyOrbs.length = 0;
+  gameState = 'interwave';
+  interwaveEndAt = performance.now() + 2000; // 2s pause
+}
+
+function updateWaves(dt){
+  // Spawn rate increases each wave (slower ramp, capped)
+  const spawnInterval = clamp(1800 - (wave-1)*150, 900, 1800); // ms
+  enemySpawnTimer += dt;
+  if (enemySpawnTimer >= spawnInterval){ enemySpawnTimer = 0; spawnEnemy(); }
+
+  // Progress wave ONLY when enough energy has been collected this wave
+  if (energyGainedThisWave >= ENERGY_GAIN_THRESHOLD){
+    nextWave = wave + 1;
+    enterInterwave();
+  }
+}
+
+function drawWaveBanner(){
+  const t = performance.now() - waveStartAt;
+  if (t < showWaveBannerFor){
+    const alpha = 1 - (t / showWaveBannerFor);
+    ctx.save(); ctx.globalAlpha = clamp(alpha,0,1);
+    ctx.font = 'bold 38px sans-serif'; ctx.fillStyle = '#00eaff';
+    const text = `WAVE ${wave}`;
+    const w = ctx.measureText(text).width;
+    ctx.fillText(text, (canvas.width - w)/2, 80);
+    ctx.restore();
+  }
+}
+
+function drawInterwave(){
+  drawStars(16.67);
+  ctx.font = 'bold 42px sans-serif'; ctx.fillStyle = '#aaf7ff';
+  const txt1 = `Wave ${wave} Complete`;
+  let w = ctx.measureText(txt1).width; ctx.fillText(txt1, (canvas.width-w)/2, canvas.height*0.42);
+  ctx.font = 'bold 28px sans-serif'; ctx.fillStyle = '#cfffff';
+  const secs = Math.ceil((interwaveEndAt - performance.now())/1000);
+  const txt2 = `Next: Wave ${nextWave} in ${Math.max(0,secs)}...`;
+  w = ctx.measureText(txt2).width; ctx.fillText(txt2, (canvas.width-w)/2, canvas.height*0.52);
+}
+
+// ---------- UI: Menu & Game Over ----------
+function drawTitle(text, y){
+  ctx.font = '900 72px sans-serif'; ctx.fillStyle = '#7ef9ff'; ctx.shadowBlur=28; ctx.shadowColor='#00eaff';
+  const w = ctx.measureText(text).width; ctx.fillText(text, (canvas.width - w)/2, y);
+  ctx.shadowBlur=0;
+}
+
+function drawButton(label, cx, cy){
+  const paddingX = 28, paddingY = 14; ctx.font = 'bold 24px sans-serif';
+  const w = ctx.measureText(label).width + paddingX*2; const h = 54;
+  const x = cx - w/2, y = cy - h/2;
+  // bg
+  ctx.fillStyle = '#0b1b22aa'; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#00eaff'; ctx.lineWidth = 2; ctx.strokeRect(x+1, y+1, w-2, h-2);
+  // text
+  ctx.fillStyle = '#cfffff'; const tw = ctx.measureText(label).width;
+  ctx.fillText(label, cx - tw/2, cy + 8);
+  return {x,y,w,h};
+}
+
+function drawMenu(){
+  // background
+  drawStars(16.67);
+  // title & instructions
+  drawTitle('CORE COLLAPSE', Math.max(110, canvas.height*0.22));
+  ctx.font = '18px monospace'; ctx.fillStyle = '#d2ffff';
+  const lines = [
+    'Move: Mouse (cursor = ship nose)',
+    'Shoot: Spacebar',
+    'Collect green energy orbs; avoid enemy bullets',
+    'Advance waves by collecting energy.'
+  ];
+  let y = canvas.height*0.32; const lineH = 26; const w = 420; const x = (canvas.width - w)/2;
+  for (const ln of lines){ ctx.fillText(ln, x, y); y += lineH; }
+  startBtn = drawButton('Start', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140));
+}
+
+function drawHUD(){
+  // energy bar
+  const bw = 200, bh = 14, x = 20, y = 20;
+  ctx.fillStyle = '#223'; ctx.fillRect(x,y,bw,bh);
+  ctx.fillStyle = '#00ffa0'; ctx.fillRect(x,y, bw*(energy/100), bh);
+  ctx.strokeStyle = '#66ffff'; ctx.lineWidth = 1; ctx.strokeRect(x,y,bw,bh);
+  ctx.font = '14px monospace'; ctx.fillStyle = '#cfffff'; ctx.fillText(`Energy: ${Math.floor(energy)}`, x, y+bh+14);
+  // wave label
+  ctx.font = '14px monospace'; ctx.fillText(`Wave ${wave}`, x, y+bh+30);
+}
+
+function drawGameOver(){
+  drawStars(16.67);
+  const t = performance.now() - gameOverAt;
+  // Fade in GAME OVER
+  if (t < 1800){
+    const a = clamp(t/800, 0, 1);
+    ctx.save(); ctx.globalAlpha = a; ctx.font = 'bold 64px sans-serif'; ctx.fillStyle = '#ff7b7b';
+    const txt = 'GAME OVER'; const w = ctx.measureText(txt).width; ctx.fillText(txt, (canvas.width-w)/2, canvas.height*0.40);
+    ctx.restore();
+  }
+  // SLAMMED bigger after
+  if (t > 1200){
+    const a = clamp((t-1200)/800, 0, 1);
+    ctx.save(); ctx.globalAlpha = a; ctx.font = '900 96px sans-serif'; ctx.fillStyle = '#ffffff';
+    const txt = 'SLAMMED'; const w = ctx.measureText(txt).width; ctx.fillText(txt, (canvas.width-w)/2, canvas.height*0.55);
+    ctx.restore();
+  }
+  // Show replay after 3.2s
+  if (t > 3200){ replayBtn = drawButton('Play Again', canvas.width/2, canvas.height*0.70); }
+}
+
+function pointInRect(px,py, r){ return px>=r.x && px<=r.x+r.w && py>=r.y && py<=r.y+r.h; }
+
+function resetGame(){
+  enemies.length = 0; enemyBullets.length = 0; playerBullets.length = 0; explosions.length = 0; exhaustParticles.length = 0; energyOrbs.length = 0;
+  energy = 60; wave = 1; gameOverAt = null; energyGainedThisWave = 0; // start below cap
+  ship.x = canvas.width/2; ship.y = canvas.height/2; aimAngle = 0; mouseX = ship.x + NOSE_OFFSET; mouseY = ship.y; prevMouseX = mouseX; prevMouseY = mouseY;
+  resetWaveTimers();
+}
+
+// ---------- Main Loop ----------
+function loop(ts){
+  const dt = Math.min(48, ts - lastTime); lastTime = ts; elapsed += dt;
+
+  // Handle non-playing states first
+  if (gameState === 'menu'){
+    drawMenu(); requestAnimationFrame(loop); return;
+  }
+  if (gameState === 'gameover'){
+    drawGameOver(); requestAnimationFrame(loop); return;
+  }
+  if (gameState === 'interwave'){
+    drawInterwave();
+    if (performance.now() >= interwaveEndAt){
+      wave = nextWave; resetWaveTimers(); gameState = 'playing';
+    }
+    requestAnimationFrame(loop); return;
+  }
+
+  // PLAYING
+  drawStars(dt);
+
+  // background core pulse overlay
+  const g = ctx.createRadialGradient(canvas.width/2, canvas.height/2, 0, canvas.width/2, canvas.height/2, Math.max(canvas.width,canvas.height)/1.4);
+  g.addColorStop(0, `rgba(20,30,40,${0.2 + 0.15*Math.sin(elapsed*0.002)})`); g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // Update
+  ship.update(dt);
+  updatePlayerBullets(dt);
+  updateEnemyBullets(dt);
+  updateEnemies(dt);
+  updateExplosions(dt);
+  updateEnergyOrbs(dt);
+
+  // Draw
+  drawEnemies();
+  drawEnemyBullets();
+  drawPlayerBullets();
+  drawExplosions();
+  drawEnergyOrbs();
+  // particles behind ship last for nicer layering
+  for (let i=exhaustParticles.length-1; i>=0; i--){
+    const p = exhaustParticles[i]; p.life -= dt; if (p.life<=0){ exhaustParticles.splice(i,1); continue; }
+    p.x += p.vx * (dt/16.67); p.y += p.vy * (dt/16.67); p.r *= 0.985;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fillStyle='rgba(0,255,255,0.35)'; ctx.shadowBlur=10; ctx.shadowColor='#00eaff'; ctx.fill(); ctx.shadowBlur=0;
+  }
+  ship.draw();
+  drawHUD();
+  drawWaveBanner();
+
+  // Waves & difficulty
+  updateWaves(dt);
+
+  // Death check
+  if (energy <= 0){
+    gameState = 'gameover'; gameOverAt = performance.now();
+    // clear active hazards for a clean screen
+    enemies.length = 0; enemyBullets.length = 0; playerBullets.length = 0; energyOrbs.length = 0; explosions.length = 0; exhaustParticles.length = 0;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// ---------- Input ----------
+canvas.addEventListener('mousemove', e=>{
+  prevMouseX = mouseX; prevMouseY = mouseY; mouseX = e.clientX; mouseY = e.clientY;
+});
+
+document.addEventListener('keydown', e=>{ if (e.code==='Space') spaceHeld = true; });
+document.addEventListener('keyup',   e=>{ if (e.code==='Space') spaceHeld = false; });
+
+canvas.addEventListener('click', e=>{
+  const x=e.clientX, y=e.clientY;
+  if (gameState==='menu' && startBtn && pointInRect(x,y,startBtn)){ gameState='playing'; resetGame(); return; }
+  if (gameState==='gameover' && replayBtn && pointInRect(x,y,replayBtn)){ gameState='playing'; resetGame(); return; }
+});
+
+// ---------- Kickoff ----------
+resetGame(); // initialize positions and timers
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
