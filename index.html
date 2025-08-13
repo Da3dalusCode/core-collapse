@@ -14,20 +14,20 @@
 <canvas id="game"></canvas>
 <script>
 // =============================
-// Core Collapse — Canvas Game (with Leaderboards)
+// Core Collapse — Canvas Game (Cloudflare Workers Leaderboard)
 // =============================
-// New in this revision:
-// - Local leaderboard (stored in localStorage)
-// - Optional public leaderboard via GitHub Issues + Actions (free on GitHub Pages)
-// - Name prompt & Submit button if score >= MIN_SUBMIT_SCORE
-// - Menu shows Local and Global (if available) high scores
-// - Wave pacing slowed; 2s interwave pause retained
+// This build uses your Worker API for the global leaderboard.
+// Endpoint you gave: core-collapse-leaderboard.colours256.workers.dev
 
 // ---------- Config ----------
-const MIN_SUBMIT_SCORE = 300;          // threshold to show "Submit score" button
-const GITHUB_USER = 'da3daluscode';   // <-- your GitHub username
-const REPO_NAME  = 'core-collapse';    // <-- your repo name (hosting the game)        // <-- set your repo name (hosting the game)
+let MIN_SUBMIT_SCORE = 300;                 // threshold to show "Submit score" button
+const API_BASE = 'https://core-collapse-leaderboard.colours256.workers.dev';
 
+// Debug mode toggled by appending '?debug=1' to the page URL
+const DEBUG = new URLSearchParams(location.search).has('debug');
+if (DEBUG) MIN_SUBMIT_SCORE = 0; // always show Submit in debug
+
+// Gameplay params
 const ENERGY_PER_ORB = 15;
 const ENERGY_GAIN_THRESHOLD = 30; // collect ~2 orbs to advance wave
 const INTERWAVE_MS = 2000;
@@ -64,19 +64,14 @@ let kills = 0; let energyCollected = 0; let lastFinalScore = 0; let lastFinalWav
 let localScores = []; let globalScores = [];
 
 // Buttons (for menu and game over)
-let startBtn = null; let replayBtn = null; let submitBtn = null;
+let startBtn = null; let replayBtn = null; let submitBtn = null; let testBtn = null; // test button appears only in DEBUG
 
 // ---------- Helpers ----------
 function rand(min, max){ return Math.random() * (max - min) + min; }
 function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
 function dist(a,b,x,y){ const dx=a-x, dy=b-y; return Math.hypot(dx,dy); }
-function issueURL(name, score, wave, kills, energy){
-  const title = `Score: ${score} by ${name}`;
-  const body = `name: ${name}\nscore: ${score}\nwave: ${wave}\nkills: ${kills}\nenergyCollected: ${energy}\ndate: ${new Date().toISOString()}`;
-  return `https://github.com/${GITHUB_USER}/${REPO_NAME}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
-}
 
-// ---------- Local/Global Leaderboards ----------
+// ---------- Local Leaderboard ----------
 function loadLocalScores(){
   try { localScores = JSON.parse(localStorage.getItem('cc_local_highscores')||'[]'); }
   catch(e){ localScores = []; }
@@ -86,9 +81,22 @@ function pushLocalScore(name, score, wave, kills, energy){
   localScores.push({name, score, wave, kills, energy, date: new Date().toISOString()});
   localScores.sort((a,b)=>b.score-a.score); localScores = localScores.slice(0,20); saveLocalScores();
 }
+
+// ---------- Global Leaderboard (Cloudflare Worker) ----------
 async function loadGlobalScores(){
-  try { const res = await fetch('scores.json', {cache:'no-store'}); if(res.ok){ globalScores = await res.json(); } }
-  catch(e){ /* ignore */ }
+  try {
+    const res = await fetch(`${API_BASE}/scores?seed=${Date.now()}`, { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        globalScores = data;
+      } else if (data && Array.isArray(data.top)) {
+        globalScores = data.top;
+      }
+      // Ensure sorted just in case
+      globalScores.sort((a,b)=> (b.score||0) - (a.score||0));
+    }
+  } catch (e) { /* ignore network errors */ }
 }
 loadLocalScores(); loadGlobalScores();
 
@@ -193,7 +201,7 @@ function updateEnemies(dt){
   for (let i=enemies.length-1; i>=0; i--){ const e = enemies[i];
     const dx = ship.x - e.x, dy = ship.y - e.y, d = Math.hypot(dx,dy) || 1;
     e.x += (dx/d) * e.speed * (dt/16.67); e.y += (dy/d) * e.speed * (dt/16.67);
-    e.fireCd -= dt; if (e.fireCd<=0){ const ang = Math.atan2(ship.y - e.y, ship.x - e.x); const sp = 3.8 + 0.2*wave;
+    e.fireCd -= dt; if (e.fireCd<=0){ const ang = Math.atan2(ship.y - e.y, ship.x - e.x); const sp = 3.8 + 0.2*wave; // slightly slower
       enemyBullets.push({ x:e.x, y:e.y, vx:Math.cos(ang)*sp, vy:Math.sin(ang)*sp, r:4 }); e.fireCd = rand(800,1300) / Math.max(1, (0.85 + 0.12*wave)); }
     if (dist(e.x,e.y,ship.x,ship.y) < e.r + 16){ energy -= 20; spawnExplosion(e.x,e.y); spawnEnergyOrb(e.x,e.y); enemies.splice(i,1); continue; }
   }
@@ -228,7 +236,7 @@ function updateWaves(dt){
   if (energyGainedThisWave >= ENERGY_GAIN_THRESHOLD){ nextWave = wave + 1; enterInterwave(); }
 }
 function drawWaveBanner(){ const t = performance.now() - waveStartAt; if (t < showWaveBannerFor){ const alpha = 1 - (t / showWaveBannerFor); ctx.save(); ctx.globalAlpha = clamp(alpha,0,1); ctx.font = 'bold 38px sans-serif'; ctx.fillStyle = '#00eaff'; const text = `WAVE ${wave}`; const w = ctx.measureText(text).width; ctx.fillText(text, (canvas.width - w)/2, 80); ctx.restore(); } }
-function drawInterwave(){ drawStars(16.67); ctx.font = 'bold 42px sans-serif'; ctx.fillStyle = '#aaf7ff'; const txt1 = `Wave ${wave} Complete`; let w = ctx.measureText(txt1).width; ctx.fillText(txt1, (canvas.width-w)/2, canvas.height*0.42); ctx.font = 'bold 28px sans-serif'; ctx.fillStyle = '#cfffff'; const secs = Math.ceil((interwaveEndAt - performance.now())/1000); const txt2 = `Next: Wave ${nextWave} in ${Math.max(0,secs)}...`; w = ctx.measureText(txt2).width; ctx.fillText(txt2, (canvas.width-w)/2, canvas.height*0.52); }
+function drawInterwave(){ drawStars(16.67); ctx.font = 'bold 42px sans-serif'; ctx.fillStyle = '#aaf7ff'; const txt1 = `Wave ${wave} Complete`; let w = ctx.measureText(txt1).width; ctx.fillText(txt1, (canvas.width-w)/2, canvas.height*0.42); ctx.font = 'bold 28px sans-serif'; ctx.fillStyle = '#cfffff'; const secs = Math.ceil((interwaveEndAt - performance.now())/1000); const txt2 = `Next: Wave ${nextWave} in ${Math.max(0,secs)}...`; w = ctx.measureText(txt2).width; ctx.fillText(txt2, (canvas.width-w)/2, canvas.height*0.52); if (DEBUG){ ctx.font = '12px monospace'; const dbg = `debug: api=${API_BASE}`; const ww = ctx.measureText(dbg).width; ctx.fillText(dbg, (canvas.width-ww)/2, canvas.height*0.58); } }
 
 // ---------- UI: Menu & Game Over ----------
 function drawTitle(text, y){ ctx.font = '900 72px sans-serif'; ctx.fillStyle = '#7ef9ff'; ctx.shadowBlur=28; ctx.shadowColor='#00eaff'; const w = ctx.measureText(text).width; ctx.fillText(text, (canvas.width - w)/2, y); ctx.shadowBlur=0; }
@@ -237,7 +245,10 @@ function drawMenu(){ drawStars(16.67); drawTitle('CORE COLLAPSE', Math.max(110, 
   // Leaderboards
   let leftX = x, rightX = x + 280, topY = y + 10; const maxShow = 5; ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#aaf7ff'; ctx.fillText('Local High Scores', leftX, topY); ctx.fillStyle = '#eaffff'; ctx.font = '16px monospace'; for (let i=0;i<Math.min(maxShow, localScores.length); i++){ const s = localScores[i]; ctx.fillText(`${i+1}. ${s.name || 'Anon'} — ${s.score}`, leftX, topY + 22*(i+1)); }
   ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#aaf7ff'; ctx.fillText('Global High Scores', rightX, topY); ctx.fillStyle = '#eaffff'; ctx.font = '16px monospace'; if (globalScores && globalScores.length){ for (let i=0;i<Math.min(maxShow, globalScores.length); i++){ const s = globalScores[i]; ctx.fillText(`${i+1}. ${s.name || 'Anon'} — ${s.score}`, rightX, topY + 22*(i+1)); } } else { ctx.fillText('(Appears after first submit)', rightX, topY + 22); }
-  startBtn = drawButton('Start', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140)); }
+  startBtn = drawButton('Start', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140));
+  testBtn = null;
+  if (DEBUG){ testBtn = drawButton('Test API (debug)', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140) + 80); ctx.font='12px monospace'; const info = `debug: api=${API_BASE}`; const iw = ctx.measureText(info).width; ctx.fillText(info, (canvas.width - iw)/2, canvas.height*0.60 + 130); }
+}
 function drawHUD(){ const bw = 200, bh = 14, x = 20, y = 20; ctx.fillStyle = '#223'; ctx.fillRect(x,y,bw,bh); ctx.fillStyle = '#00ffa0'; ctx.fillRect(x,y, bw*(energy/100), bh); ctx.strokeStyle = '#66ffff'; ctx.lineWidth = 1; ctx.strokeRect(x,y,bw,bh); ctx.font = '14px monospace'; ctx.fillStyle = '#cfffff'; ctx.fillText(`Energy: ${Math.floor(energy)}`, x, y+bh+14); ctx.fillText(`Wave ${wave}`, x, y+bh+30); ctx.fillText(`Kills ${kills}`, x, y+bh+46); }
 function drawGameOver(){ drawStars(16.67); const t = performance.now() - gameOverAt; if (t < 1800){ const a = clamp(t/800, 0, 1); ctx.save(); ctx.globalAlpha = a; ctx.font = 'bold 64px sans-serif'; ctx.fillStyle = '#ff7b7b'; const txt = 'GAME OVER'; const w = ctx.measureText(txt).width; ctx.fillText(txt, (canvas.width-w)/2, canvas.height*0.40); ctx.restore(); } if (t > 1200){ const a = clamp((t-1200)/800, 0, 1); ctx.save(); ctx.globalAlpha = a; ctx.font = '900 96px sans-serif'; ctx.fillStyle = '#ffffff'; const txt = 'SLAMMED'; const w = ctx.measureText(txt).width; ctx.fillText(txt, (canvas.width-w)/2, canvas.height*0.55); ctx.restore(); }
   // Final score
@@ -271,9 +282,42 @@ function loop(ts){ const dt = Math.min(48, ts - lastTime); lastTime = ts; elapse
 canvas.addEventListener('mousemove', e=>{ prevMouseX = mouseX; prevMouseY = mouseY; mouseX = e.clientX; mouseY = e.clientY; });
 document.addEventListener('keydown', e=>{ if (e.code==='Space') spaceHeld = true; });
 document.addEventListener('keyup',   e=>{ if (e.code==='Space') spaceHeld = false; });
-canvas.addEventListener('click', async e=>{ const x=e.clientX, y=e.clientY; if (gameState==='menu' && startBtn && pointInRect(x,y,startBtn)){ gameState='playing'; resetGame(); return; } if (gameState==='gameover'){ if (replayBtn && pointInRect(x,y,replayBtn)){ gameState='playing'; resetGame(); return; } if (submitBtn && pointInRect(x,y,submitBtn)){ const name = (prompt('High score! Enter your name:')||'Anonymous').trim().slice(0,24); if(!name) return; // save locally
-      pushLocalScore(name, lastFinalScore, lastFinalWave, lastFinalKills, lastFinalEnergy); // refresh globals on next menu visit
-      try { window.open(issueURL(name, lastFinalScore, lastFinalWave, lastFinalKills, lastFinalEnergy), '_blank'); } catch{} return; } } });
+canvas.addEventListener('click', async e=>{ const x=e.clientX, y=e.clientY; if (gameState==='menu'){
+    if (startBtn && pointInRect(x,y,startBtn)){ gameState='playing'; resetGame(); return; }
+    if (DEBUG && testBtn && pointInRect(x,y,testBtn)){
+      // Quick POST to verify API wiring
+      try{
+        const res = await fetch(`${API_BASE}/scores`, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ name:'Debug', score:123, wave:1, kills:0, energy:0 }) });
+        const data = await res.json();
+        alert(res.ok ? 'API OK' : `API error: ${data && data.reason}`);
+        await loadGlobalScores();
+      }catch{ alert('API unreachable'); }
+      return;
+    }
+  }
+  if (gameState==='gameover'){
+    if (replayBtn && pointInRect(x,y,replayBtn)){ gameState='playing'; resetGame(); return; }
+    if (submitBtn && pointInRect(x,y,submitBtn)){
+      const name = (prompt('High score! Enter your name:')||'Anonymous').trim().slice(0,24); if(!name) return; // save locally
+      pushLocalScore(name, lastFinalScore, lastFinalWave, lastFinalKills, lastFinalEnergy); // keep local board
+      try {
+        const res = await fetch(`${API_BASE}/scores`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name, score: lastFinalScore, wave: lastFinalWave, kills: lastFinalKills, energy: lastFinalEnergy })
+        });
+        const data = await res.json().catch(()=>null);
+        if (res.ok && data && Array.isArray(data.top)) {
+          globalScores = data.top; // immediate update
+        }
+        alert(res.ok ? 'Score submitted!' : 'Submitted locally. Global board unavailable.');
+      } catch {
+        alert('Submitted locally. Global board unavailable.');
+      }
+      return;
+    }
+  }
+});
 
 // ---------- Kickoff ----------
 resetGame(); requestAnimationFrame(loop);
