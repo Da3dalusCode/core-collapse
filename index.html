@@ -61,7 +61,7 @@ const explosions = []; const exhaustParticles = []; const energyOrbs = [];
 
 // Scores
 let kills = 0; let energyCollected = 0; let lastFinalScore = 0; let lastFinalWave = 1; let lastFinalKills = 0; let lastFinalEnergy = 0;
-let localScores = []; let globalScores = [];
+let globalScores = [];
 
 // Buttons (for menu and game over)
 let startBtn = null; let replayBtn = null; let submitBtn = null; let testBtn = null; // test button appears only in DEBUG
@@ -70,17 +70,6 @@ let startBtn = null; let replayBtn = null; let submitBtn = null; let testBtn = n
 function rand(min, max){ return Math.random() * (max - min) + min; }
 function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
 function dist(a,b,x,y){ const dx=a-x, dy=b-y; return Math.hypot(dx,dy); }
-
-// ---------- Local Leaderboard ----------
-function loadLocalScores(){
-  try { localScores = JSON.parse(localStorage.getItem('cc_local_highscores')||'[]'); }
-  catch(e){ localScores = []; }
-}
-function saveLocalScores(){ localStorage.setItem('cc_local_highscores', JSON.stringify(localScores)); }
-function pushLocalScore(name, score, wave, kills, energy){
-  localScores.push({name, score, wave, kills, energy, date: new Date().toISOString()});
-  localScores.sort((a,b)=>b.score-a.score); localScores = localScores.slice(0,20); saveLocalScores();
-}
 
 // ---------- Global Leaderboard (Cloudflare Worker) ----------
 async function loadGlobalScores(){
@@ -98,7 +87,7 @@ async function loadGlobalScores(){
     }
   } catch (e) { /* ignore network errors */ }
 }
-loadLocalScores(); loadGlobalScores();
+loadGlobalScores();
 
 // ---------- Background Stars ----------
 function initStars() {
@@ -242,9 +231,20 @@ function drawInterwave(){ drawStars(16.67); ctx.font = 'bold 42px sans-serif'; c
 function drawTitle(text, y){ ctx.font = '900 72px sans-serif'; ctx.fillStyle = '#7ef9ff'; ctx.shadowBlur=28; ctx.shadowColor='#00eaff'; const w = ctx.measureText(text).width; ctx.fillText(text, (canvas.width - w)/2, y); ctx.shadowBlur=0; }
 function drawButton(label, cx, cy){ const paddingX = 28; ctx.font = 'bold 24px sans-serif'; const w = ctx.measureText(label).width + paddingX*2; const h = 54; const x = cx - w/2, y = cy - h/2; ctx.fillStyle = '#0b1b22aa'; ctx.fillRect(x, y, w, h); ctx.strokeStyle = '#00eaff'; ctx.lineWidth = 2; ctx.strokeRect(x+1, y+1, w-2, h-2); ctx.fillStyle = '#cfffff'; const tw = ctx.measureText(label).width; ctx.fillText(label, cx - tw/2, cy + 8); return {x,y,w,h}; }
 function drawMenu(){ drawStars(16.67); drawTitle('CORE COLLAPSE', Math.max(110, canvas.height*0.22)); ctx.font = '18px monospace'; ctx.fillStyle = '#d2ffff'; const lines = ['Move: Mouse (cursor = ship nose)','Shoot: Spacebar','Collect green energy orbs; avoid enemy bullets','Advance waves by collecting energy.']; let y = canvas.height*0.32; const lineH = 26; const w = 480; const x = (canvas.width - w)/2; for (const ln of lines){ ctx.fillText(ln, x, y); y += lineH; }
-  // Leaderboards
-  let leftX = x, rightX = x + 280, topY = y + 10; const maxShow = 10; ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#aaf7ff'; ctx.fillText('Local High Scores', leftX, topY); ctx.fillStyle = '#eaffff'; ctx.font = '16px monospace'; for (let i=0;i<Math.min(maxShow, localScores.length); i++){ const s = localScores[i]; ctx.fillText(`${i+1}. ${s.name || 'Anon'} — ${s.score}`, leftX, topY + 22*(i+1)); }
-  ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#aaf7ff'; ctx.fillText('Global High Scores', rightX, topY); ctx.fillStyle = '#eaffff'; ctx.font = '16px monospace'; if (globalScores && globalScores.length){ for (let i=0;i<Math.min(maxShow, globalScores.length); i++){ const s = globalScores[i]; ctx.fillText(`${i+1}. ${s.name || 'Anon'} — ${s.score}`, rightX, topY + 22*(i+1)); } } else { ctx.fillText('(Appears after first submit)', rightX, topY + 22); }
+  // Leaderboard (global only)
+  const topY = y + 10; const maxShow = 10;
+  ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#aaf7ff';
+  const head = 'Global High Scores'; let hw = ctx.measureText(head).width; ctx.fillText(head, (canvas.width - hw)/2, topY);
+  ctx.fillStyle = '#eaffff'; ctx.font = '16px monospace';
+  if (globalScores && globalScores.length){
+    for (let i=0;i<Math.min(maxShow, globalScores.length); i++){
+      const s = globalScores[i]; const line = `${i+1}. ${s.name || 'Anon'} — ${s.score}`; const lw = ctx.measureText(line).width;
+      ctx.fillText(line, (canvas.width - lw)/2, topY + 22*(i+1));
+    }
+  } else {
+    const msg='(Appears after first submit)'; const mw = ctx.measureText(msg).width;
+    ctx.fillText(msg, (canvas.width - mw)/2, topY + 22);
+  }
   startBtn = drawButton('Start', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140));
   testBtn = null;
   if (DEBUG){ testBtn = drawButton('Test API (debug)', canvas.width/2, Math.min(canvas.height*0.60, canvas.height-140) + 80); ctx.font='12px monospace'; const info = `debug: api=${API_BASE}`; const iw = ctx.measureText(info).width; ctx.fillText(info, (canvas.width - iw)/2, canvas.height*0.60 + 130); }
@@ -299,8 +299,7 @@ canvas.addEventListener('click', async e=>{ const x=e.clientX, y=e.clientY; if (
     if (replayBtn && pointInRect(x,y,replayBtn)){ gameState='playing'; resetGame(); return; }
     if (submitBtn && pointInRect(x,y,submitBtn)){
       const name = (prompt('High score! Enter your name:')||'Anonymous').trim().slice(0,24); if(!name) return; // save locally
-      pushLocalScore(name, lastFinalScore, lastFinalWave, lastFinalKills, lastFinalEnergy); // keep local board
-      try {
+            try {
         const res = await fetch(`${API_BASE}/scores`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
